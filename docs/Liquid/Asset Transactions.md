@@ -109,7 +109,7 @@ Sort: `permute_outputs(tx, cltvs, htlcmap)` (`channeld/commit_tx.c:431`), which 
 2. `leftover = funding_sats − paid` (abort on underflow, `:136-137`). If 0, return.
 3. Add `leftover` to output `opener_outnum` if the opener has a direct output, else to `other_outnum` (`:145-150`). It `assert`s that one of them exists.
 
-What the leftover is: msat → unit rounding of both balances and of each HTLC (`amount_msat_to_sat_round_down`). **Trimmed HTLCs** don't get here: on Bitcoin they go to fees, and on a commitment here their units go to an OP_RETURN burn output first (`channel_asset_add_burn`), so nobody, the opener included, gains from the other side's dust HTLCs. Why a direct output always exists: both channel reserves are ≥ dust (`check_config_bounds`, `openingd/common.c:56-72`), and the opener's balance is never cut for anchors (§3 of [[Liquid Asset Channels]]). Unit test: `test_finish_tx` (`common/test/run-channel_asset.c:145-195`).
+What the leftover is: msat → unit rounding of both balances and of each HTLC (`amount_msat_to_sat_round_down`). **No HTLC worth a unit is trimmed**: both sides' dust limit is one unit (`ASSET_DUST_LIMIT`; Elements has no dust rule for issued assets), so every such HTLC has its own output and nobody, the opener included, gains from the other side's small HTLCs. Why a direct output always exists: both channel reserves are ≥ dust (`check_config_bounds`, `openingd/common.c:56-72`), and the opener's balance is never cut for anchors (§3 of [[Liquid Asset Channels]]). Unit test: `test_finish_tx` (`common/test/run-channel_asset.c:145-195`).
 
 ### Fee
 

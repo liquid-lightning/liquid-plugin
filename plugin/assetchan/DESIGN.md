@@ -108,8 +108,10 @@ Explicit (unblinded) outputs only.
   carries, so core caps the HTLCs to what it pays for at Elements' 0.1 sat/vB relay floor
   (`asset_commit_max_htlcs`; an explicit HTLC output is ~78 vB): each side accepts at most
   half (2,000 sat: 164 in all, 82 each; 1,000 sat: 36), and a peer asking for more is
-  refused. Both channel reserves must be at least the dust limit, so a commitment always
-  has a direct output to take whatever the HTLC outputs don't pay out.
+  refused. Both dust limits must be one unit (`ASSET_DUST_LIMIT`: Elements has no dust
+  rule for issued assets), so no HTLC worth a unit is trimmed and each has its output;
+  both channel reserves must be at least that, so a commitment always has a direct
+  output to take the msat rounding the outputs don't pay out.
 - **HTLC txs**: upstream anchors behaviour (zero fee, `SIGHASH_SINGLE|ANYONECANPAY`,
   broadcaster adds wallet L-BTC); output 0 carries the asset tag.
 - **Mutual close**: legacy `closing_signed` only (`option_simple_close` is skipped for
@@ -355,8 +357,9 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
 - The anchors (660 sat) come out of the fee reserve, never the asset balances: the
   affordability checks in `full_channel.c`, `channeld`, `openingd/common.c` and
   `lightningd/peer_control.c` skip them for asset channels.
-- Dust limit / `htlc_minimum` are negotiated in "satoshis" but mean asset units:
-  plugin policy per asset later.
+- Dust limit / `htlc_minimum` are negotiated in "satoshis" but mean asset units. Core
+  fixes the dust limit at one unit (no trimming, so no burn output for trimmed HTLCs,
+  which an earlier version had); `htlc_minimum`: plugin policy per asset later.
 - **Gossip** (`test_gossip`). Asset channels are never announced: nothing in
   `channel_announcement`/`channel_update` says which asset a channel is in, and counting
   asset units as capacity (the reverted C8) let any self-issued asset fake capacity. So

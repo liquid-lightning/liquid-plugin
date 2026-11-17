@@ -40,7 +40,7 @@ What follows from this design:
 
 - **No fee comes out of the asset balances.** `commit_tx_base_fee()` returns 0 for an asset channel (`common/initial_commit_tx.h:63-79`). That makes `update_fee` a no-op: channeld is unchanged and still processes `update_fee` (`channeld/channeld.c:776`), but the feerate affects no output.
 - **The fee is fixed.** On a commitment it's the reserve minus the anchors: `reserve - 660` with both anchors, `reserve - 330` with only one. BOLT 3 rule 8 adds an anchor only for a side that has a direct output or untrimmed HTLCs (`common/initial_commit_tx.c:294-305`, `channeld/commit_tx.c:396-412`). On a mutual close the fee is the **whole** reserve (`closingd/closingd.c:705-706`).
-- **Asset conservation.** The asset outputs always add up to the funding amount. Trimmed HTLCs, which go to fees on Bitcoin, are burned to an OP_RETURN output in the asset (`channel_asset_add_burn`). What's still not an output (msat rounding) tops up the opener's direct output, or the other side's if the opener has none: `channel_asset_finish_tx()`.
+- **Asset conservation.** The asset outputs always add up to the funding amount. No HTLC worth a unit is trimmed (both dust limits are one unit, `ASSET_DUST_LIMIT`), so every HTLC has its output. What's still not an output (msat rounding) tops up the opener's direct output, or the other side's if the opener has none: `channel_asset_finish_tx()`.
 - **A broadcaster fee input can't work** (txid change, see above). Only package relay on Elements would let the reserve shrink to just the anchors (DESIGN §4, §7).
 - **The commitment can still be bumped.** When its fixed fee falls short of the feerate an HTLC deadline calls for, core CPFPs it through our anchor with L-BTC from CLN's wallet. HTLCs in the asset say nothing about what's worth paying in L-BTC, so instead of upstream's "HTLCs worth more than the fee" check the anchor spend is capped by `asset_fee_cap`: one fee reserve, ten within 12 blocks of the deadline (`lightningd/anchorspend.c` `try_anchor_psbt`). The same cap applies to every sweep and HTLC tx of ours (L13 in [[Safety Invariants]]).
 
@@ -112,7 +112,7 @@ All defined in `wire/peer_wire.csv` (diff vs upstream: `+16` lines). `funding_cr
 | Reserve within policy | Plugin option checks | Plugin `openchannel` hook: `[assetchan-min-fee-reserve, assetchan-max-fee-reserve]`, default 1000..10000 (`assetchan.py:519-524`) |
 | Asset allowed | — | Plugin hook: `asset in assetchan-asset` (`assetchan.py:516-518`) |
 | Not announced | Plugin refuses `announce=true` (`assetchan.py:284-286`) | Plugin hook rejects `channel_flags & 1` (`assetchan.py:512-515`) |
-| HTLC cap, reserves ≥ dust | `limit_asset_htlcs` + `check_config_bounds` (§4) | Same |
+| HTLC cap, dust limit of one unit, reserves ≥ dust | `asset_channel_config` + `check_config_bounds` (§4) | Same |
 | v2 / dual-fund | Not wired: `fundchannel_start` is v1 only | [!question] No explicit dual-fund refusal found in `openingd/dualopend.c` (its diff is 4 lines). DESIGN says v2 is "refused". The fundee path only parses `channel_asset` in v1 `open_channel`. |
 | Splicing | `channel_for_splice` "Asset channels cannot be spliced" `lightningd/channel_control.c:2364-2368` | channeld `splice_accepter` `channeld/channeld.c:4376-4380` |
 
@@ -149,10 +149,10 @@ How the cap is enforced:
 1. **Lower our own limit.** `limit_asset_htlcs()` (`openingd/openingd.c:282-294`) sets `localconf.max_accepted_htlcs` to half the cap if it's higher. The opener calls it at `openingd/openingd.c:358`, the fundee at `:1157-1158`. lightningd's defaults are 483 on liquid-regtest/liquid-testnet (`testnet_config`, `lightningd/options.c:987`) and 30 on Liquid mainnet (`mainnet_config`, `:1055`). With a 2,000 sat reserve, the cap only bites on test networks.
 2. **Tell lightningd.** The lowered value goes back in `openingd_funder_reply.our_max_accepted_htlcs` / `openingd_fundee.our_max_accepted_htlcs` (`openingd/openingd_wire.csv`), which `opening_funder_finished`/`opening_fundee_finished` store (`lightningd/opening_control.c:412`, `:539`).
 3. **Refuse a greedy peer.** `check_config_bounds()` (`openingd/common.c:45-86`) fails the open if `remote.max_accepted_htlcs + local.max_accepted_htlcs > max`.
-4. **Reserves ≥ dust.** The same block fails the open unless **both** channel reserves are at least the larger dust limit (`openingd/common.c:56-72`). Why: every asset commitment pays out all of the asset, and leftovers top up a direct output, so one direct output must always exist. A side that has reached its reserve keeps an output of at least the dust limit. At open, the opener holds the whole funding minus the push.
+4. **Dust limit of one unit, reserves ≥ dust.** The same block fails the open unless **both** dust limits are exactly one unit (`ASSET_DUST_LIMIT`: Elements has no dust rule for issued assets, and a trimmed HTLC would top up the opener's output) and **both** channel reserves are at least that (`openingd/common.c`). Why: every asset commitment pays out all of the asset, and leftovers top up a direct output, so one direct output must always exist. A side that has reached its reserve keeps an output of at least the dust limit. At open, the opener holds the whole funding minus the push.
 
 > [!note] Dust limits and `htlc_minimum` are in asset units
-> They are negotiated as "satoshis" but mean units of the asset. Per-asset policy for them is future plugin work (DESIGN §7).
+> They are negotiated as "satoshis" but mean units of the asset. The dust limit is fixed at one unit by core; per-asset policy for `htlc_minimum` is future plugin work (DESIGN §7).
 
 ### The 660-sat deductions skipped
 

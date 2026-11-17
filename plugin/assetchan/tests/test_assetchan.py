@@ -941,22 +941,22 @@ def test_plain_payments_avoid_asset_channels(node_factory, bitcoind):
 
 
 @unittest.skipIf(TEST_NETWORK != 'liquid-regtest', 'Liquid only')
-def test_trimmed_htlc_burned(node_factory, bitcoind):
-    """A trimmed (dust) HTLC's units are burned to an OP_RETURN on the
-    commitment, as a trimmed HTLC's sats go to the miners on Bitcoin: they
-    used to top up the opener's output, so the opener profited from the
-    other side's dust HTLCs.  onchaind ignores the burn, like the fee
-    output, and everything else resolves as usual."""
+def test_no_htlc_trimmed(node_factory, bitcoind):
+    """An asset channel's dust limit is one unit on both sides (Elements has
+    no dust rule for issued assets), so no HTLC worth a unit is trimmed: even
+    a 1-unit HTLC gets its output on the commitment and is resolved on chain
+    like any other.  (A trimmed HTLC can't go to the miners as on Bitcoin:
+    it would top up the opener's output, or have to be burned.)"""
     asset = issue_asset(bitcoind)
     opts = node_opts(bitcoind, asset)
     # l2 hangs up instead of failing the HTLC, which stays in flight.
     l1, l2 = node_factory.get_nodes(2, opts=[opts, {**opts, 'disconnect': ['-WIRE_UPDATE_FAIL_HTLC']}])
     chan = open_asset_channel(bitcoind, l1, l2, asset)['channel_id']
-    dust = channel(l1, chan)['dust_limit_msat'] // 1000
-    trimmed = dust - 1
+    for n in (l1, l2):
+        assert channel(n, chan)['dust_limit_msat'] == 1000
     close_to = channel(l1, chan)['close_to_addr']
 
-    send_htlc(l1, l2, chan, trimmed, '01' * 32, '01' * 32)
+    send_htlc(l1, l2, chan, 1, '01' * 32, '01' * 32)
     l2.daemon.wait_for_log('dev_disconnect: -WIRE_UPDATE_FAIL_HTLC')
     for n in (l1, l2):
         wait_for(lambda: not channel(n, chan)['peer_connected'])
@@ -964,15 +964,22 @@ def test_trimmed_htlc_burned(node_factory, bitcoind):
     commit_txid = only_one(l1.rpc.close(chan, unilateraltimeout=1)['txids'])
     blockhash = bitcoind.generate_block(1, wait_for_mempool=commit_txid)[0]
     commit = bitcoind.rpc.getrawtransaction(commit_txid, True, blockhash)
-    asset_outs = [v for v in commit['vout'] if v.get('asset') == asset]
-    burn = only_one([v for v in asset_outs if v['scriptPubKey']['hex'] == '6a'])
-    assert units(burn['value']) == trimmed
-    # Only l1's balance, with no top-up: l2 has none, and no HTLC output.
-    assert sorted(units(v['value']) for v in asset_outs) == sorted([trimmed, CHANNEL_UNITS - trimmed])
+    # l1's balance and the HTLC, each in an output of its own (l2 has no
+    # balance), and nothing else in the asset.
+    asset_outs = {v['n']: units(v['value']) for v in commit['vout'] if v.get('asset') == asset}
+    assert sorted(asset_outs.values()) == [1, CHANNEL_UNITS - 1]
+    htlc_n = only_one([n for n, u in asset_outs.items() if u == 1])
 
-    # onchaind takes the burn for what it is, and l1 gets its balance.
-    mine_spends_of(bitcoind, [l1, l2], commit_txid, 1, maxblocks=40)
-    wait_for(lambda: close_units(bitcoind, asset, close_to) == CHANNEL_UNITS - trimmed)
+    # l1 takes the HTLC back after its timeout (its HTLC-timeout tx, then
+    # that tx's delayed output) and sweeps its balance: the whole channel
+    # ends up at its close address.
+    first_block = bitcoind.rpc.getblockcount() + 1
+    spends = mine_spends_of(bitcoind, [l1, l2], commit_txid, 2, maxblocks=40)
+    htlc_tx = only_one([tx for tx in spends.values()
+                        if spends_from(tx, commit_txid) == [(0, htlc_n)]])
+    assert units(htlc_tx['vout'][0]['value']) == 1
+    mine_spends_of(bitcoind, [l1, l2], htlc_tx['txid'], 1, since=first_block, vout=0)
+    wait_for(lambda: close_units(bitcoind, asset, close_to) == CHANNEL_UNITS)
     assert not l1.daemon.is_in_log('Could not find resolution')
     bitcoind.generate_block(100)
     l1.daemon.wait_for_log('onchaind complete, forgetting peer')
