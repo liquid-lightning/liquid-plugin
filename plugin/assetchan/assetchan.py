@@ -17,7 +17,11 @@ plugin does the rest, with an elementsd wallet holding the assets:
 - `assetchan-pay` pays over channels in the invoice's asset only, through an
   askrene layer per asset (`assetchan-layer`): asset channels are never
   announced, so every gossiped channel is an ordinary L-BTC one, and an
-  asset payment goes over our own channels and the invoice's route hints;
+  asset payment goes over our own channels, the asset channels other
+  plugins told us about, and the invoice's route hints;
+- asset gossip: plugins tell each other their asset channels in a custom
+  message (see "asset gossip" below), since BOLT 7 gossip can't carry them.
+  Core is not involved: the channels only ever exist in our askrene layers;
 - after a unilateral close, core sweeps our asset outputs to our close
   address itself, paying the fees with L-BTC from CLN's own wallet (keep
   some there; elementsd's wallet only funds opens).
@@ -36,6 +40,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 # Asset channels' feature bit (common/features.h OPT_CHANNEL_ASSET, odd:
 # optional).  Plugins can only set feature bits at startup.
@@ -52,6 +57,10 @@ plugin.lbtc = None           # L-BTC's asset id
 plugin.invoice_assets = {}   # payment_hash -> asset of that invoice of ours
 plugin.layers = {}           # askrene layer we created -> scids disabled in it
 plugin.layers_lock = threading.Lock()
+plugin.node_id = None        # our node id
+plugin.known = {}            # asset gossip: (scid, source) -> record
+plugin.known_lock = threading.Lock()
+plugin.applied = {}          # askrene layer -> {(scid, source): what we told askrene}
 
 LBTC = 'lbtc'                           # the "asset" of an ordinary channel
 INVOICE_KEY = ['assetchan', 'invoice']  # datastore: + [payment_hash] -> asset
@@ -303,7 +312,7 @@ def open_channel(plugin, id, amount, asset, fee_reserve, announce, close_to):
     try:
         addr = script_address(ed, script) or start['funding_address']
         # The funding transaction, explicit throughout (so nothing is
-        # blinded, and core can check it): the asset to the channel at
+        # blinded; funding_outnum checks it below, core does not): the asset to the channel at
         # output 0, the L-BTC fee reserve to it at output 1, then the change
         # and the fee.
         fee = funding_fee(ed, 2, 5)
@@ -447,14 +456,19 @@ def assetchan_invoice(plugin, amount, asset, label, description, expiry=None):
     return inv
 
 
-def asset_layer(plugin, asset):
+def asset_layer(plugin, asset, hinted=()):
     """The askrene layer `assetchan.<asset>`: every channel known to be in
     another asset disabled, so a payment in `asset` is only routed over
     channels in it.  Those are our channels in other assets (by scid and
     local alias) and, for an asset other than L-BTC, every gossiped
     channel: asset channels are never announced, so gossip is all L-BTC.
-    (The invoice's route hints, which askrene adds, stay usable.)"""
+    The asset channels of other nodes that asset gossip told us about are
+    added to it.  (The invoice's route hints, which askrene adds, stay
+    usable.)  With `hinted` (the channels an invoice's route hints name),
+    a layer of its own that leaves enabling those to xpay."""
     layer = 'assetchan.' + asset
+    if hinted and asset != LBTC:
+        layer += '.' + hashlib.sha256(' '.join(sorted(hinted)).encode()).hexdigest()[:16]
     with plugin.layers_lock:
         disabled = plugin.layers.get(layer)
         if disabled is None:
@@ -484,6 +498,7 @@ def asset_layer(plugin, asset):
             for c in plugin.rpc.listchannels()['channels']:
                 if c['short_channel_id'] not in ours:
                     disable(c['short_channel_id'])
+            apply_asset_gossip(plugin, layer, asset, hinted)
     return layer
 
 
@@ -508,13 +523,246 @@ def assetchan_pay(plugin, request, bolt11, asset, maxfee=None):
     in_background(request, pay, plugin, bolt11, asset, maxfee)
 
 
+def hinted_channels(plugin, bolt11):
+    """The channels (scid/direction) the invoice's route hints name: xpay
+    makes those itself, in its own layer for this payment."""
+    inv = plugin.rpc.decode(bolt11)
+    hinted = set()
+    for route in inv.get('routes', []):
+        for hop, to in zip(route, [h['pubkey'] for h in route[1:]] + [inv['payee']]):
+            hinted.add('{}/{}'.format(hop['short_channel_id'], 0 if hop['pubkey'] < to else 1))
+    return hinted
+
+
 def pay(plugin, bolt11, asset, maxfee):
-    params = {'invstring': bolt11, 'layers': [asset_layer(plugin, asset)]}
+    layer = asset_layer(plugin, asset, hinted_channels(plugin, bolt11))
+    params = {'invstring': bolt11, 'layers': [layer]}
     if maxfee is not None:
         params['maxfee'] = maxfee
-    res = plugin.rpc.call('xpay', params)
+    try:
+        res = plugin.rpc.call('xpay', params)
+    except RpcError as e:
+        # xpay's own error, not pyln's dump of the call (invoice and all).
+        if not isinstance(e.error, dict) or 'message' not in e.error:
+            raise
+        raise RpcException(e.error['message'], e.error.get('code', -32600))
     res['asset'] = asset
     return res
+
+
+# ------------------------------------------------------------- asset gossip
+# BOLT 7 gossip can't say which asset a channel is in, so asset channels are
+# never announced and core knows none but our own.  The plugins tell each
+# other instead, in a custom message: each node sends one record per asset
+# channel it can forward into (direction: it -> its peer), every node passes
+# on what it hears, and assetchan-pay adds the records to the asset's
+# askrene layer.  Nothing here reaches core's gossip.
+#
+# A record names the channel as its source forwards by it: its local alias,
+# which core takes in an onion for any channel, announced or not.  So one
+# channel has two names, one per direction, and each is a one-way channel
+# in the layer.  Records are not signed: a false one costs a payer a failed
+# attempt (xpay then routes around it), never funds, as every forward is
+# still checked asset by asset.  They do tell every asset-channel node that
+# the channel exists, and its size.
+GOSSIP_TYPE = 43217                     # odd: peers without the plugin ignore it
+GOSSIP_EXPIRY = 900                     # a record not refreshed for this long is dropped
+GOSSIP_MAX = 5000                       # records we keep
+GOSSIP_FIELDS = ('capacity_msat', 'htlc_minimum_msat', 'htlc_maximum_msat', 'fee_base_msat',
+                 'fee_proportional_millionths', 'cltv_expiry_delta')
+
+
+def own_records(plugin):
+    """A record for each asset channel of ours that can forward right now."""
+    records = []
+    for c in our_channels(plugin):
+        scid = c.get('alias', {}).get('local') or c.get('short_channel_id')
+        upd = c.get('updates', {}).get('local')
+        if ('asset' not in c or c.get('state') != 'CHANNELD_NORMAL' or not c.get('peer_connected')
+                or scid is None or upd is None):
+            continue
+        records.append({'scid': scid, 'source': plugin.node_id, 'destination': c['peer_id'],
+                        'asset': c['asset'], 'ts': int(time.time()),
+                        'capacity_msat': int(c['total_msat']),
+                        'htlc_minimum_msat': int(upd['htlc_minimum_msat']),
+                        'htlc_maximum_msat': int(upd['htlc_maximum_msat']),
+                        'fee_base_msat': int(upd['fee_base_msat']),
+                        'fee_proportional_millionths': int(upd['fee_proportional_millionths']),
+                        'cltv_expiry_delta': int(upd['cltv_expiry_delta'])})
+    return records
+
+
+def checked_record(plugin, r):
+    """A record from a peer, cleaned up; None if we have no use for it."""
+    try:
+        rec = {'scid': str(r['scid']), 'source': str(r['source']).lower(),
+               'destination': str(r['destination']).lower(), 'asset': str(r['asset']),
+               'ts': int(r['ts']), **{f: int(r[f]) for f in GOSSIP_FIELDS}}
+        check_asset(rec['asset'])
+        for node in (rec['source'], rec['destination']):
+            if len(bytes.fromhex(node)) != 33:
+                return None
+        if len([int(x) for x in rec['scid'].split('x')]) != 3:
+            return None
+    except (KeyError, TypeError, ValueError, RpcException):
+        return None
+    now = time.time()
+    if (rec['asset'] not in allowed_assets(plugin) or rec['source'] == rec['destination']
+            or rec['source'] == plugin.node_id or min(rec[f] for f in GOSSIP_FIELDS) < 0
+            or not now - GOSSIP_EXPIRY < rec['ts'] <= now + 600):
+        return None
+    return rec
+
+
+def send_records(plugin, peers, records):
+    for peer in peers:
+        for r in records:
+            msg = GOSSIP_TYPE.to_bytes(2, 'big') + json.dumps(r, separators=(',', ':')).encode()
+            try:
+                plugin.rpc.call('sendcustommsg', {'node_id': peer, 'msg': msg.hex()})
+            except RpcError:
+                break       # gone since listpeers: the next round reaches it
+
+
+def connected_peers(plugin):
+    return [p['id'] for p in plugin.rpc.listpeers()['peers'] if p.get('connected')]
+
+
+def asset_gossip(plugin, peers=None):
+    """Bring our own records up to date, forget the stale ones, and send
+    all we know to `peers` (default: every connected peer)."""
+    own = own_records(plugin)
+    now = time.time()
+    with plugin.known_lock:
+        for key in [k for k, r in plugin.known.items()
+                    if r['source'] == plugin.node_id or r['ts'] <= now - GOSSIP_EXPIRY]:
+            del plugin.known[key]
+        for r in own:
+            plugin.known[(r['scid'], r['source'])] = r
+        records = list(plugin.known.values())
+    send_records(plugin, connected_peers(plugin) if peers is None else peers, records)
+
+
+def asset_gossip_soon(plugin, peers=None):
+    """asset_gossip in a thread of its own, in a moment (a peer that just
+    connected, a channel that just opened: let core finish with it)."""
+    def run():
+        time.sleep(2)
+        try:
+            asset_gossip(plugin, peers)
+        except Exception as e:
+            plugin.log('asset gossip: {}'.format(e), 'debug')
+    threading.Thread(target=run, daemon=True).start()
+
+
+def asset_gossip_loop(plugin):
+    """Every assetchan-gossip-interval seconds (a third of what a record
+    lives, by default): refresh ours, send all we know."""
+    while True:
+        time.sleep(plugin.get_option('assetchan-gossip-interval'))
+        try:
+            asset_gossip(plugin)
+        except Exception as e:
+            plugin.log('asset gossip: {}'.format(e), 'debug')
+
+
+@plugin.hook('custommsg')
+def on_custommsg(plugin, peer_id, payload, **kwargs):
+    """A peer's asset gossip record: keep it if it is news, and pass it on."""
+    raw = bytes.fromhex(payload)
+    if int.from_bytes(raw[:2], 'big') != GOSSIP_TYPE:
+        return {'result': 'continue'}
+    try:
+        rec = checked_record(plugin, json.loads(raw[2:]))
+    except ValueError:
+        rec = None
+    if rec is None:
+        return {'result': 'continue'}
+    key = (rec['scid'], rec['source'])
+    with plugin.known_lock:
+        old = plugin.known.get(key)
+        news = (old is None and len(plugin.known) < GOSSIP_MAX) or (old is not None and rec['ts'] > old['ts'])
+        if news:
+            plugin.known[key] = rec
+    if news:
+        def relay():
+            try:
+                send_records(plugin, [p for p in connected_peers(plugin) if p != peer_id], [rec])
+            except Exception as e:
+                plugin.log('asset gossip: {}'.format(e), 'debug')
+        threading.Thread(target=relay, daemon=True).start()
+    return {'result': 'continue'}
+
+
+@plugin.subscribe('connect')
+def on_connect(plugin, **kwargs):
+    """A peer is back: tell it what we know."""
+    peer = kwargs.get('connect', kwargs).get('id')
+    if peer and plugin.node_id:
+        asset_gossip_soon(plugin, [peer])
+
+
+@plugin.subscribe('channel_state_changed')
+def on_channel_state_changed(plugin, channel_state_changed, **kwargs):
+    """An asset channel of ours opened or closed: tell everyone."""
+    if plugin.node_id and 'CHANNELD_NORMAL' in (channel_state_changed.get('old_state'),
+                                                channel_state_changed.get('new_state')):
+        asset_gossip_soon(plugin)
+
+
+def apply_asset_gossip(plugin, layer, asset, hinted=()):
+    """Make `layer` hold exactly the gossiped channels in `asset` (not ours:
+    askrene knows those), each one-way, source to destination.  Called with
+    layers_lock held.
+
+    A channel made in a layer is disabled until some layer enables it, so
+    we do.  Not those in `hinted`, though: xpay makes and enables them in
+    its payment's layer, and disables them there when they fail; ours
+    comes after it, and what we said would undo that (xpay would retry the
+    same route until it timed out)."""
+    now = time.time()
+    with plugin.known_lock:
+        want = {k: r for k, r in plugin.known.items()
+                if r['asset'] == asset and r['ts'] > now - GOSSIP_EXPIRY
+                and plugin.node_id not in (r['source'], r['destination'])}
+    applied = plugin.applied.setdefault(layer, {})
+
+    def scidd(r):
+        return '{}/{}'.format(r['scid'], 0 if r['source'] < r['destination'] else 1)
+
+    for key in [k for k in applied if k not in want]:
+        gone = scidd(applied.pop(key))
+        if gone not in hinted:
+            plugin.rpc.call('askrene-update-channel',
+                            {'layer': layer, 'short_channel_id_dir': gone, 'enabled': False})
+    for key, r in want.items():
+        told = {f: r[f] for f in ('scid', 'source', 'destination') + GOSSIP_FIELDS}
+        if applied.get(key) == told:
+            continue
+        try:
+            plugin.rpc.call('askrene-create-channel',
+                            {'layer': layer, 'source': r['source'], 'destination': r['destination'],
+                             'short_channel_id': r['scid'], 'capacity_msat': r['capacity_msat']})
+        except RpcError:
+            pass            # we made it before (and tell askrene what changed below)
+        try:
+            plugin.rpc.call('askrene-update-channel',
+                            {'layer': layer, 'short_channel_id_dir': scidd(r),
+                             **({} if scidd(r) in hinted else {'enabled': True}),
+                             **{f: r[f] for f in GOSSIP_FIELDS if f != 'capacity_msat'}})
+        except RpcError as e:
+            # A record askrene won't take (a peer made it up): payments go on without it.
+            plugin.log('asset gossip: ignoring {}: {}'.format(r['scid'], e), 'debug')
+            continue
+        applied[key] = told
+
+
+@plugin.method('assetchan-listgossip')
+def assetchan_listgossip(plugin, asset=None):
+    """The asset channels we know of from asset gossip (ours included), only
+    those in {asset} if given: one record per direction."""
+    with plugin.known_lock:
+        return {'channels': [r for r in plugin.known.values() if asset in (None, r['asset'])]}
 
 
 # -------------------------------------------------------------------- hooks
@@ -779,6 +1027,8 @@ def init(options, configuration, plugin, **kwargs):
     if options['assetchan-close-to'] not in ('elements', 'none'):
         return {'disable': "assetchan-close-to must be 'elements' or 'none'"}
     load_invoice_assets(plugin)
+    plugin.node_id = plugin.rpc.getinfo()['id']
+    threading.Thread(target=asset_gossip_loop, args=(plugin,), daemon=True).start()
     plugin.log('fee reserve {}..{} sat (default {}), closing to {}'.format(
         options['assetchan-min-fee-reserve'], options['assetchan-max-fee-reserve'],
         options['assetchan-default-fee-reserve'], options['assetchan-close-to']))
@@ -795,6 +1045,10 @@ plugin.add_option('assetchan-max-fee-reserve', 10000,
                   opt_type='int')
 plugin.add_option('assetchan-default-fee-reserve', 2000,
                   'L-BTC fee reserve (sat) assetchan-open puts up by default',
+                  opt_type='int')
+plugin.add_option('assetchan-gossip-interval', 300,
+                  'Seconds between two rounds of asset gossip (our asset channels, and those'
+                  ' we heard of, sent to every peer); a channel is forgotten after 900',
                   opt_type='int')
 plugin.add_option('assetchan-close-to', 'elements',
                   "Where our asset goes when a channel closes: a fresh address of"

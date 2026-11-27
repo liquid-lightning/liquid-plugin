@@ -794,6 +794,57 @@ def test_gossip(node_factory, bitcoind):
         n.rpc.getinfo()
 
 
+@unittest.skipIf(TEST_NETWORK != 'liquid-regtest', 'Liquid only')
+def test_asset_gossip(node_factory, bitcoind):
+    """A line of asset channels l1-l2-l3-l4, all private.  BOLT 7 gossip
+    knows none of them, and l4's invoice only hints at l3-l4: l1 pays l4
+    (and l4 pays l1) over the two hops the plugins told each other about."""
+    asset = issue_asset(bitcoind)
+    opts = {**node_opts(bitcoind, asset), 'assetchan-gossip-interval': 5}
+    nodes = l1, l2, l3, l4 = node_factory.get_nodes(4, opts=opts)
+    chans = [open_asset_channel(bitcoind, a, b, asset)['channel_id']
+             for a, b in ((l1, l2), (l2, l3), (l3, l4))]
+    sync_blockheight(bitcoind, nodes)
+    for n in nodes:
+        assert n.rpc.listchannels()['channels'] == []
+
+    def known(n):
+        return {(c['source'], c['destination'])
+                for c in n.rpc.call('assetchan-listgossip', {'asset': asset})['channels']}
+
+    # Every node learns both directions of all three channels.
+    line = {(a.info['id'], b.info['id']) for a, b in ((l1, l2), (l2, l3), (l3, l4))}
+    line |= {(b, a) for a, b in line}
+    for n in nodes:
+        wait_for(lambda: known(n) == line)
+    # (Named as their source forwards by them: its alias of the channel.)
+    assert only_one([c for c in l1.rpc.call('assetchan-listgossip')['channels']
+                     if c['source'] == l3.info['id'] and c['destination'] == l4.info['id']]
+                    )['scid'] == channel(l3, chans[2])['alias']['local']
+
+    def pay_far(payer, payee, amount, label):
+        wait_for(lambda: payee.rpc.listincoming()['incoming'])
+        inv = payee.rpc.call('assetchan-invoice', {'amount': amount, 'asset': asset,
+                                                   'label': label, 'description': label})
+        res = payer.rpc.call('assetchan-pay', {'bolt11': inv['bolt11'], 'asset': asset})
+        assert res['failed_parts'] == 0
+        settled(*nodes)
+
+    #    (Enough for l4 to pay back from: 1% of the channel, PAY_UNITS, is
+    #    its reserve.)
+    pay_far(l1, l4, 3 * PAY_UNITS, 'gossip-1')
+    assert channel(l4, chans[2])['to_us_msat'] == 3 * PAY_UNITS * 1000
+    #    (l2 and l3 each took a fee from what l1 sent.)
+    assert channel(l1, chans[0])['to_us_msat'] < (CHANNEL_UNITS - 3 * PAY_UNITS) * 1000
+    pay_far(l4, l1, PAY_UNITS // 2, 'gossip-2')
+    assert channel(l4, chans[2])['to_us_msat'] < (3 * PAY_UNITS - PAY_UNITS // 2) * 1000
+
+    # A channel nobody refreshes is forgotten: once l4 is gone, l3 stops
+    # sending its side of l3-l4 at once (the peer is not connected).
+    l4.stop()
+    wait_for(lambda: (l3.info['id'], l4.info['id']) not in known(l3))
+
+
 FORWARD_TO = os.path.join(os.getcwd(), 'tests/plugins/forward_to_channel.py')
 
 

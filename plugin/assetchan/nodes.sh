@@ -29,7 +29,7 @@
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "${LIGHTNING_SRC:-$here/../../../lightning}" && pwd)   # the CLN checkout
+root=$(cd "${LIGHTNING_SRC:-$here/../../../../lightning}" && pwd)   # the CLN checkout
 network=${ASSETCHAN_NETWORK:-liquid-testnet}
 case "$network" in
 liquid-testnet)
